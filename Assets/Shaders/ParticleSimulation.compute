@@ -318,7 +318,6 @@ void PrepareMovementDirections(float2 velocity, uint seed, out int2 directions[8
     else 
     {
         // If no significant velocity, shuffle directions randomly (Fisher-Yates shuffle)
-
         for (int i = 7; i > 0; i--) 
         {
             uint shuffleSeed = seed * 31u + (uint)i * 17u + 42u;
@@ -580,21 +579,6 @@ void CSRemoveSand(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// float2 CalculateAttractionForce(float2 position, float2 attractPosition, float attractionStrength, float attractionRadius)
-// {
-//     float2 direction = attractPosition - position;
-//     float distance = length(direction);
-
-//     if (distance <= attractionRadius)
-//     {
-//         direction = normalize(direction);
-//         float forceMagnitude = attractionStrength / (distance * distance + 1);
-//         return direction * forceMagnitude * smoothstep(0, attractionRadius * 0.5, distance);
-//     }
-
-//     return float2(0, 0);
-// }
-
 float2 CalculateAttractionForce(float2 position, float2 attractPosition, float attractionStrength, float attractionRadius)
 {
     float2 direction = attractPosition - position;
@@ -661,26 +645,4 @@ void CSAttractFromData(uint3 id : SV_DispatchThreadID)
 
         VelocityWrite[pos] = currentVelocity + float4(totalForce, 0, 0);
     }
-
-    // if (OccupancyWrite[pos] == 1 && PositionWrite[pos].w == 1)
-    // {
-    //     float2 position = float2(pos);
-    //     float2 closestForce = float2(0, 0);
-    //     float closestDistance = 1e10; // A large initial value
-
-    //     for (uint i = 0; i < AttractorsCount; i++)
-    //     {
-    //         AttractorData attractor = Attractors[i];
-    //         float distance = length(position - attractor.position);
-            
-    //         if (distance < closestDistance)
-    //         {
-    //             closestDistance = distance;
-    //             closestForce = CalculateAttractionForce(position, attractor.position, attractor.attractionForce * AttractionMultiplier, AttractionRadius);
-    //         }
-    //     }
-
-    //     float4 currentVelocity = VelocityWrite[pos];
-    //     VelocityWrite[pos] = currentVelocity + float4(closestForce, 0, 0);
-    // }
 }

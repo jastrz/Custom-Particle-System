@@ -19,35 +19,42 @@ Shader "Custom/Particle"
         
         Pass
         {
-            CGPROGRAM
+            HLSLPROGRAM
 
             #pragma vertex vert
             #pragma fragment frag
             
-            #include "UnityCG.cginc"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             
-            struct appdata
+            struct Attributes
             {
-                float4 vertex : POSITION;
+                float4 positionOS : POSITION;
                 float2 uv : TEXCOORD0;
                 uint vertexID : SV_VertexID;
                 uint instanceID : SV_InstanceID;
             };
             
-            struct v2f
+            struct Varyings
             {
                 float2 uv : TEXCOORD0;
-                float4 vertex : SV_POSITION;
+                float4 positionHCS : SV_POSITION;
                 float4 color : COLOR;
-                float3 worldPos : TEXCOORD1;
-                float3 normal : TEXCOORD2;
+                float3 positionWS : TEXCOORD1;
+                float3 normalWS : TEXCOORD2;
             };
             
-            sampler2D _MainTex;
-            sampler2D _ColorTex;
-            float4 _MainTex_TexelSize;
-            float _CellSize;
-            float _Size;
+            TEXTURE2D(_MainTex);
+            SAMPLER(sampler_MainTex);
+            TEXTURE2D(_ColorTex);
+            SAMPLER(sampler_ColorTex);
+            
+            CBUFFER_START(UnityPerMaterial)
+                float4 _MainTex_ST;
+                float4 _MainTex_TexelSize;
+                float4 _ColorTex_ST;
+                float _CellSize;
+                float _Size;
+            CBUFFER_END
             
             // Get grid coordinates from instance ID
             int2 GetGridCoord(uint instanceID)
@@ -56,16 +63,17 @@ Shader "Custom/Particle"
                 return int2(instanceID % width, instanceID / width);
             }
             
-            v2f vert (appdata v, uint instanceID : SV_InstanceID)
+            Varyings vert (Attributes input, uint instanceID : SV_InstanceID)
             {
-                v2f o;
+                Varyings output;
                 
                 // Get grid coordinates
                 int2 gridCoord = GetGridCoord(instanceID);
                 
                 // Sample position texture to check if cell is occupied
-                float4 positionData = tex2Dlod(_MainTex, float4(gridCoord * _MainTex_TexelSize.xy, 0, 0));
-                float4 colorData = tex2Dlod(_ColorTex, float4(gridCoord * _MainTex_TexelSize.xy, 0, 0));
+                float2 texCoord = gridCoord * _MainTex_TexelSize.xy;
+                float4 positionData = SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, texCoord, 0);
+                float4 colorData = SAMPLE_TEXTURE2D_LOD(_ColorTex, sampler_ColorTex, texCoord, 0);
                 float2 particlePos = positionData.xy;
                 float isOccupied = positionData.w;
 
@@ -79,7 +87,7 @@ Shader "Custom/Particle"
                 };
 
                 // Get vertex position based on vertex ID
-                float2 quadPos = quadVertices[v.vertexID] * _Size;
+                float2 quadPos = quadVertices[input.vertexID] * _Size;
                 
                 // Calculate world position
                 float2 worldPos = (particlePos + quadPos) * _CellSize;
@@ -89,39 +97,39 @@ Shader "Custom/Particle"
                 worldPos -= gridCenter;
                 
                 // Convert to clip space
-                o.vertex = UnityObjectToClipPos(float4(worldPos, 0, 1));
-                o.worldPos = float3(worldPos, 0);
+                float3 positionWS = float3(worldPos, 0);
+                output.positionHCS = TransformWorldToHClip(positionWS);
+                output.positionWS = positionWS;
 
                 if(positionData.w > 1.0)
                 {
                     colorData = float4(1,1,1,1);
                 }
                 
-                o.color = colorData;
-                o.uv = quadPos + 0.5;
-                o.normal = float3(0, 0, 1);
+                output.color = colorData;
+                output.uv = quadPos + 0.5;
+                output.normalWS = float3(0, 0, 1);
 
                 // Hide empty cells by moving them off-screen
                 if (isOccupied < 0.5) {
-                    o.vertex = float4(2000, 2000, 2000, 1);
+                    output.positionHCS = float4(2000, 2000, 2000, 1);
                 }
                 
-                return o;
+                return output;
             }
 
-            fixed4 frag (v2f i) : SV_Target
+            half4 frag (Varyings input) : SV_Target
             {
-                float2 centeredUV = i.uv - 0.5;
+                float2 centeredUV = input.uv - 0.5;
                 float dist = length(centeredUV);
                 if (dist > 0.5 * _Size) {
                     discard;
                 }
 
-                return i.color;
+                return input.color;
             }
 
-
-            ENDCG
+            ENDHLSL
         }
     }
 }

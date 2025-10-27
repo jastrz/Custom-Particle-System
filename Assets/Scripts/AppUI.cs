@@ -14,7 +14,6 @@ namespace CPS
 
         void OnQuit()
         {
-            Debug.Log("Quit!");
             Application.Quit();
         }
     }
