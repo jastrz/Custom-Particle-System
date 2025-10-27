@@ -1,9 +1,8 @@
-#  Custom Particle System (CPS)
+#  Custom 2D Particle System 
 
 Early version of **GPU-accelerated 2D particle simulation** built in **Unity** using **Compute Shaders**.  
 It supports physics-based movement, attractors, dynamic sand-like interactions, and real-time particle manipulation.
 
----
 
 ## 🎥 Demos
 
