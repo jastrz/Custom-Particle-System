@@ -1,0 +1,686 @@
+#pragma kernel CSInit
+#pragma kernel CSSimulate
+#pragma kernel CSAddSand
+#pragma kernel CSRemoveSand
+#pragma kernel CSAttract
+#pragma kernel CSAttractFromData
+
+struct AttractorData
+{
+    float2 position;
+    float attractionForce;
+};
+
+// Textures
+RWTexture2D<float4> PositionRead;
+RWTexture2D<float4> PositionWrite;
+RWTexture2D<float4> VelocityRead;
+RWTexture2D<float4> VelocityWrite;
+RWTexture2D<float4> ColorRead;
+RWTexture2D<float4> ColorWrite;
+
+RWTexture2D<uint> OccupancyRead;
+RWTexture2D<uint> OccupancyWrite;
+
+// Particle colors for initialization
+StructuredBuffer<float4> Colors;
+int ColorCount;
+
+int AttractorsCount;
+StructuredBuffer<AttractorData> Attractors;
+
+// Grid dimensions
+int GridWidth;
+int GridHeight;
+
+// Particle system parameters
+float Gravity;
+float Friction;
+float DeltaTime;
+float Time;
+float2 DampingRange;
+float2 DisplacementRange;
+float MaxSpeed;
+
+float2 AddPosition;
+int AddAmount;
+int AddType;
+int AddMethod;
+int AddRadius;
+
+float2 RemovePosition;
+int RemoveRadius;
+int FrameNum;
+
+float2 AttractPosition;
+float AttractionStrength;
+float AttractionRadius;
+float AttractionMultiplier;
+
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+float rand(uint seed)
+{
+    return float(wang_hash(seed)) / 4294967296.0;
+}
+
+bool IsInBounds(int2 pos)
+{
+    return pos.x >= 0 && pos.x < GridWidth && pos.y >= 0 && pos.y < GridHeight;
+}
+
+float2 hash2(float2 p)
+{
+    return frac(sin(float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)))) * 43758.5453);
+}
+
+bool IsInsideBlob(float2 position, float2 blobCenter, float blobRadius)
+{
+    return distance(position, blobCenter) < blobRadius;
+}
+
+bool IsCellOccupied(int2 pos)
+{
+    if (!IsInBounds(pos)) return true; 
+    return OccupancyRead[pos] > 0;
+}
+
+void CreateUniformSandDistribution(uint3 id, inout float4 position, inout float4 color)
+{
+    if (id.y > (uint)(GridHeight / 2))
+    {
+        uint seed = id.x * 1000 + id.y;
+        if (rand(seed) < 0.5) 
+        {
+            position.w = 1.0; // Mark as occupied
+            OccupancyWrite[id.xy] = 1;
+            
+            // Assign random color
+            int colorIndex = (int)(rand(seed + 100) * ColorCount);
+            color = Colors[colorIndex];
+        }
+        else
+        {
+            OccupancyWrite[id.xy] = 0;
+        }
+    }
+    else
+    {
+        OccupancyWrite[id.xy] = 0;
+    }
+}
+
+void AddRandomInitialVelocity(uint3 id, inout float4 velocity)
+{
+    uint seedX = wang_hash(id.x * 1973 + id.y * 9277 + FrameNum * 26699 + 12345);
+    uint seedY = wang_hash(id.y * 6997 + id.x * 7919 + FrameNum * 19423 + 54321);
+    
+    // velocity between -1 and 1
+    float2 randomVelocity = float2(
+        rand(seedX) * 2.0 - 1.0, 
+        rand(seedY) * 2.0 - 1.0
+    );
+    
+    // Consistent magnitude
+    float velocityScale = 2.0;
+    
+    // Uniform direction with consistent speed
+    float magnitude = length(randomVelocity);
+    if (magnitude > 0.0001) {
+        randomVelocity = normalize(randomVelocity) * velocityScale;
+    }
+    
+    velocity.xy = randomVelocity;
+}
+
+void CreateParticleBlobs(uint3 id, inout float4 position, inout float4 color)
+{
+    float2 uv = float2(id.x / (float)GridWidth, id.y / (float)GridHeight);
+    
+    int numBlobs = 0;//20;
+    float blobRadius = 0.1; 
+    
+    for (int i = 0; i < numBlobs; i++)
+    {
+        float2 blobCenter = hash2(float2(i * Time, 0)) * 0.8 + 0.1; // Distribute blobs
+        
+        if (IsInsideBlob(uv, blobCenter, blobRadius))
+        {
+            position.w = 1.0;
+            OccupancyWrite[id.xy] = 1;
+            
+            // Assign random color
+            uint seed = id.x * 1000 + id.y + i * 10000;
+            int colorIndex = (int)(rand(seed) * ColorCount);
+            color = Colors[colorIndex];
+            
+            return; 
+        }
+    }
+    
+    // If not in any blob, mark as empty
+    OccupancyWrite[id.xy] = 0;
+}
+
+[numthreads(8,8,1)]
+void CSInit (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)GridWidth || id.y >= (uint)GridHeight)
+        return;
+        
+    // Initialize all cells as empty
+    float4 position = float4(id.x, id.y, 0, 0); // w component is occupancy (0 = empty, 1 = occupied)
+    float4 velocity = float4(0, 0, 0, 0);
+    float4 color = float4(0, 0, 0, 0);
+
+    int ditributionMethod = 1;
+    
+    // Choose distribution method
+    switch (ditributionMethod)
+    {
+        case 0:
+            CreateUniformSandDistribution(id, position, color);
+            break;
+        case 1:
+            CreateParticleBlobs(id, position, color);
+            break;
+    }
+
+    // Add random initial velocity to occupied cells
+    if (position.w > 0.5)
+    {
+        AddRandomInitialVelocity(id, velocity);
+    }
+    
+    // Write to textures
+    PositionWrite[id.xy] = position;
+    VelocityWrite[id.xy] = velocity;
+    ColorWrite[id.xy] = color;
+}
+
+// Physics calculation functions
+float4 ApplyGravityAndFriction(float4 velocity, uint seed)
+{
+    // Apply gravity to velocity with some randomness
+    float gravityVariation = 1.0 + (rand(seed) - 0.5) * 0.1;
+    velocity.y += (-Gravity) * DeltaTime;
+    
+    // Apply damping/friction differently based on speed
+    float speed = length(velocity.xy);
+    float frictionFactor = lerp(0.00, Friction, saturate(speed / MaxSpeed));
+    velocity.xy *= (1.0 - frictionFactor);
+
+    // Limit velocity
+    velocity.xy = clamp(velocity.xy, float2(-MaxSpeed, -MaxSpeed), float2(MaxSpeed, MaxSpeed));
+    
+    return velocity;
+}
+
+float4 GetVelocityColor(float4 velocity)
+{
+    float velocityRatio = length(velocity.xy) / MaxSpeed;
+
+    float scaledRatio = pow(velocityRatio, 4.0); 
+
+    return lerp(Colors[0], Colors[1], scaledRatio);
+}
+
+// Movement attempt functions
+bool TryPrimaryMovement(int2 pos, float2 newPos, int2 newPosInt, float4 position, 
+                        float4 velocity, float4 color)
+{
+    if(IsInBounds(newPosInt) && OccupancyRead[newPosInt] == 0)
+    {
+        uint originalValue;
+        InterlockedCompareExchange(OccupancyWrite[newPosInt], 0, 1, originalValue);
+
+        if (originalValue == 0)
+        {
+            // Move particle to new position
+            PositionWrite[newPosInt] = float4(newPos, 0, 1);
+            VelocityWrite[newPosInt] = velocity;
+            ColorWrite[newPosInt] = GetVelocityColor(velocity);
+            OccupancyWrite[newPosInt] = 1;
+
+            // Clear the old position
+            PositionWrite[pos] = float4(0, 0, 0, 0);
+            VelocityWrite[pos] = float4(0, 0, 0, 0);
+            ColorWrite[pos] = float4(0, 0, 0, 0);
+            OccupancyWrite[pos] = 0;
+
+            return true;
+        }
+    }
+    return false;
+}
+
+// Prepares movement directions prioritized by velocity alignment
+void PrepareMovementDirections(float2 velocity, uint seed, out int2 directions[8])
+{
+    // Movement directions
+    directions[0] = int2(0, -1);  // Down
+    directions[1] = int2(1, -1);  // Down-right
+    directions[2] = int2(-1, -1); // Down-left
+    directions[3] = int2(1, 0);   // Right
+    directions[4] = int2(-1, 0);  // Left
+    directions[5] = int2(0, 1);   // Up
+    directions[6] = int2(1, 1);   // Up-right
+    directions[7] = int2(-1, 1);  // Up-left
+    
+    // Only sort directions if velocity is significant
+    if (length(velocity.xy) > 0.1) {
+
+        // Score each direction based on alignment with velocity
+        float2 normalizedVel = normalize(velocity.xy);
+        float scores[8];
+        
+        for (int i = 0; i < 8; i++) 
+        {
+            // Normalize diagonal directions to have same magnitude as cardinal directions
+            float2 dir = float2(directions[i]);
+
+            if (abs(dir.x) + abs(dir.y) > 1.0) 
+            {
+                dir = normalize(dir);
+            }
+            
+            scores[i] = dot(dir, normalizedVel); // Alignment with velocity
+        }
+        
+        // Bubble sort to order directions by score
+        for (int i = 0; i < 7; i++) 
+        {
+            for (int j = 0; j < 7 - i; j++) 
+            {
+                if (scores[j] < scores[j + 1])
+                {
+
+                    // Swap scores and directions
+                    float tempScore = scores[j];
+                    scores[j] = scores[j + 1];
+                    scores[j + 1] = tempScore;
+                    
+                    int2 tempDir = directions[j];
+                    directions[j] = directions[j + 1];
+                    directions[j + 1] = tempDir;
+                }
+            }
+        }
+    } 
+    else 
+    {
+        // If no significant velocity, shuffle directions randomly (Fisher-Yates shuffle)
+
+        for (int i = 7; i > 0; i--) 
+        {
+            uint shuffleSeed = seed * 31u + (uint)i * 17u + 42u;
+            int j = int(rand(shuffleSeed) * (i + 1));
+            int2 temp = directions[i];
+            directions[i] = directions[j];
+            directions[j] = temp;
+        }
+    }
+    
+    // Add some randomness to prevent uniform patterns
+    float randomFactor = rand(seed * 13u + 100u);
+
+    if (randomFactor < 0.15) 
+    {
+        int idx1 = int(rand(seed + 101) * 4); // Only swap among the first few directions
+        int idx2 = 4 + int(rand(seed + 102) * 4); // With one from the less directions
+        
+        int2 temp = directions[idx1];
+        directions[idx1] = directions[idx2];
+        directions[idx2] = temp;
+    }
+}
+
+bool TryAlternativeMovement(int2 pos, float4 velocity, float4 color, uint seed, int2 directions[8])
+{
+    // Try each direction in the prioritized order
+    for (int i = 0; i < 8; i++)
+    {
+        int2 altPosInt = pos + directions[i];
+
+        if(IsInBounds(altPosInt) && OccupancyRead[altPosInt] == 0)
+        {
+            uint originalValue;
+
+            InterlockedCompareExchange(OccupancyWrite[altPosInt], 0, 1, originalValue);
+
+            if (originalValue == 0)
+            {
+                // Small random offset for less grid-like appearance
+                uint offsetSeedX = seed * 23u + 201u;
+                uint offsetSeedY = seed * 29u + 202u;
+                float2 posOffset = float2(
+                    rand(offsetSeedX) * 2.0 - 1,
+                    rand(offsetSeedY) * 2.0 - 1
+                );
+                
+                // Move particle to alternative position
+                PositionWrite[altPosInt] = float4(altPosInt + posOffset, 0, 1);
+                
+                // Adjust velocity based on collision direction
+                float2 moveDir = normalize(float2(directions[i]));
+                float currentSpeed = length(velocity.xy);
+                
+                // Blend between current velocity and the direction we moved
+                // with balanced influence to avoid directional bias
+                float2 newVel = lerp(velocity.xy, moveDir * currentSpeed, 0.5);
+                float4 directionalVel = float4(newVel, 0, 0);
+                float4 resultingVel = lerp(velocity, directionalVel, 0.5);
+                VelocityWrite[altPosInt] = resultingVel;
+                
+                ColorWrite[altPosInt] = GetVelocityColor(resultingVel);
+                OccupancyWrite[altPosInt] = 1;
+
+                // Clear the old position
+                PositionWrite[pos] = float4(0, 0, 0, 0);
+                VelocityWrite[pos] = float4(0, 0, 0, 0);
+                ColorWrite[pos] = float4(0, 0, 0, 0);
+                OccupancyWrite[pos] = 0;
+
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void HandleStationaryParticle(int2 pos, float4 position, float4 velocity, float4 color, uint occupied, uint seed)
+{
+    // Calculate density around particle
+    int neighborCount = 0;
+    float2 averageDisplacement = float2(0, 0);
+    
+    for (int y = -1; y <= 1; y++) 
+    {
+        for (int x = -1; x <= 1; x++) 
+        {
+            if (x == 0 && y == 0) continue;
+            
+            int2 checkPos = pos + int2(x, y);
+
+            if (IsInBounds(checkPos) && (OccupancyRead[checkPos] > 0 && OccupancyWrite[checkPos] > 0)) 
+            {
+                neighborCount++;
+
+                // Keep track of direction to neighbors (for collision response)
+                averageDisplacement += float2(x, y);
+            }
+        }
+    }
+    
+    // If we have neighbors, use them to inform our bounce direction
+    float2 collisionResponse;
+    if (neighborCount > 0) 
+    {
+        // Create a repulsion vector away from the average neighbor direction
+        averageDisplacement /= float(neighborCount);
+        collisionResponse = -normalize(averageDisplacement);
+        collisionResponse += float2(
+            rand(seed + 301) * 2.0 - 1.0,
+            rand(seed + 302) * 2.0 - 1.0
+        );
+    } 
+    else 
+    {
+        // No neighbors, just use simple reflection
+        collisionResponse = float2(
+            rand(seed + 301) * 2.0 - 1.0,
+            rand(seed + 302) * 2.0 - 1.0
+        );
+    }
+    
+    float collisionDamping = lerp(DampingRange.y, DampingRange.x, saturate(neighborCount / 8.0));
+    float randomScale = lerp(DisplacementRange.x, DisplacementRange.y, saturate(neighborCount / 8.0));
+    
+    // Balanced collision response to avoid directional bias
+    velocity = float4(velocity.xy * collisionDamping + collisionResponse * randomScale,0, 0);
+    VelocityWrite[pos] = velocity;
+    
+    PositionWrite[pos] = position;
+    ColorWrite[pos] = GetVelocityColor(velocity);
+    OccupancyWrite[pos] = occupied;
+}
+
+[numthreads(8,8,1)]
+void CSSimulate (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)GridWidth || id.y >= (uint)GridHeight)
+        return;
+        
+    int2 pos = int2(id.x, id.y);
+    float4 position = PositionRead[pos];
+    float4 velocity = VelocityRead[pos];
+    float4 color = ColorRead[pos];
+    uint occupied = OccupancyRead[pos];
+
+    if(occupied > 0)
+    {
+        if(position.w != 1)
+        {
+            PositionWrite[pos] = position;
+            OccupancyWrite[pos] = 1;
+            return;
+        }
+
+        // Calculate seed for consistent random behavior
+        uint seed = id.x * 1000 * FrameNum + id.y * 77 * FrameNum;
+        
+        // Apply physics
+        velocity = ApplyGravityAndFriction(velocity, seed);
+        VelocityWrite[pos] = velocity;
+
+        // Calculate new position based on velocity
+        float2 newPos = position.xy + velocity.xy;
+        int2 newPosInt = int2(round(newPos));
+
+        bool moved = false;
+
+        // Try primary movement
+        moved = TryPrimaryMovement(pos, newPos, newPosInt, position, velocity, color);
+
+        if (!moved)
+        {
+            // Prepare movement directions for alternative movement
+            int2 directions[8];
+            PrepareMovementDirections(velocity.xy, seed, directions);
+            
+            // Try alternative movement
+            moved = TryAlternativeMovement(pos, velocity, color, seed, directions);
+        }
+
+        if (!moved)
+        {
+            // Handle stationary particle
+            HandleStationaryParticle(pos, position, velocity, color, occupied, seed);
+        }
+    }
+}
+
+[numthreads(1,1,1)]
+void CSAddSand (uint3 id : SV_DispatchThreadID)
+{
+    if (AddMethod == 0)
+    {
+        for (int i = 0; i < AddAmount; i++)
+        {
+            float seed = FrameNum * (id.x * GridWidth + id.y + i);
+            float2 randomOffset = float2(rand(seed), rand(seed + 1)) * 50 - 25;
+            float2 position = AddPosition + randomOffset;
+            
+            uint2 texCoord = (uint2)position;
+            
+            if (texCoord.x >= 0 && texCoord.x < (uint)GridWidth &&
+                texCoord.y >= 0 && texCoord.y < (uint)GridHeight)
+            {
+                PositionWrite[texCoord] = float4(position, 0, AddType);
+
+                float4 velocity = float4(0,0,0,0);
+                
+                AddRandomInitialVelocity(id, velocity);
+
+                VelocityWrite[texCoord] = velocity;
+                ColorWrite[texCoord] = float4(rand(texCoord), rand(texCoord + 1), rand(texCoord + 2), 1);
+                OccupancyWrite[texCoord] = 1;
+            }
+        }
+    }
+    else if (AddMethod == 1)
+    {
+        // circular shape
+        for (int x = -AddRadius; x <= AddRadius; x++)
+        {
+            for (int y = -AddRadius; y <= AddRadius; y++)
+            {
+                    float2 position = AddPosition + float2(x, y);
+                    uint2 texCoord = (uint2)position;
+                    
+                    if (texCoord.x >= 0 && texCoord.x < GridWidth &&
+                        texCoord.y >= 0 && texCoord.y < GridHeight)
+                    {
+                        PositionWrite[texCoord] = float4(position, 0, AddType);
+                        VelocityWrite[texCoord] = float4(0, 0, 0, 0);
+                        // ColorWrite[texCoord] = float4(rand(texCoord), rand(texCoord + 1), rand(texCoord + 2), 1);
+                        OccupancyWrite[texCoord] = 1;
+                    }
+            }
+        }
+    }
+}
+
+[numthreads(1,1,1)]
+void CSRemoveSand(uint3 id : SV_DispatchThreadID)
+{
+    float2 position = RemovePosition;
+    float radius = RemoveRadius;
+
+    for (uint x = max(0, position.x - radius); x <= min(GridWidth - 1, position.x + radius); x++)
+    {
+        for (uint y = max(0, position.y - radius); y <= min(GridHeight - 1, position.y + radius); y++)
+        {
+            if (distance(float2(x, y), position) <= radius)
+            {
+                PositionWrite[uint2(x, y)] = float4(0, 0, 0, 0);  // Reset position
+                VelocityWrite[uint2(x, y)] = float4(0, 0, 0, 0);  // Reset velocity
+                ColorWrite[uint2(x, y)] = float4(0, 0, 0, 0);     // Reset color
+                OccupancyWrite[uint2(x, y)] = 0;                  // Set as not occupied
+            }
+        }
+    }
+}
+
+// float2 CalculateAttractionForce(float2 position, float2 attractPosition, float attractionStrength, float attractionRadius)
+// {
+//     float2 direction = attractPosition - position;
+//     float distance = length(direction);
+
+//     if (distance <= attractionRadius)
+//     {
+//         direction = normalize(direction);
+//         float forceMagnitude = attractionStrength / (distance * distance + 1);
+//         return direction * forceMagnitude * smoothstep(0, attractionRadius * 0.5, distance);
+//     }
+
+//     return float2(0, 0);
+// }
+
+float2 CalculateAttractionForce(float2 position, float2 attractPosition, float attractionStrength, float attractionRadius)
+{
+    float2 direction = attractPosition - position;
+    float distanceSquared = dot(direction, direction);
+
+    if (distanceSquared <= attractionRadius * attractionRadius)
+    {
+        if (distanceSquared < 1e-6) // Check if positions are very close
+        {
+            return float2(0, 0); // No force if positions are practically the same
+        }
+
+        float distance = sqrt(distanceSquared);
+
+        direction /= distance;
+
+        float forceMagnitude = attractionStrength / (distanceSquared + 1);
+
+        return direction * forceMagnitude * smoothstep(0, attractionRadius * 0.5, distance);
+    }
+
+    return float2(0, 0);
+}
+
+[numthreads(8,8,1)]
+void CSAttract(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    if (pos.x >= GridWidth || pos.y >= GridHeight) return;
+
+    if (OccupancyWrite[pos] == 1 && PositionWrite[pos].w == 1)
+    {
+        float2 position = float2(pos);
+
+        float2 force = CalculateAttractionForce(position, AttractPosition, AttractionStrength, AttractionRadius);
+        
+        float4 currentVelocity = VelocityWrite[pos];
+
+        VelocityWrite[pos] = currentVelocity + float4(force, 0, 0);
+    }
+}
+
+[numthreads(8,8,1)]
+void CSAttractFromData(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    if (pos.x >= GridWidth || pos.y >= GridHeight) return;
+
+    if (OccupancyWrite[pos] == 1 && PositionWrite[pos].w == 1)
+    {
+        float2 position = float2(pos);
+        float2 totalForce = float2(0, 0);
+
+        for (uint i = 0; i < AttractorsCount; i++)
+        {
+            AttractorData attractor = Attractors[i];
+
+            float2 force = CalculateAttractionForce(position, attractor.position, attractor.attractionForce * AttractionMultiplier, AttractionRadius);
+
+            totalForce += force;
+        }
+
+        float4 currentVelocity = VelocityWrite[pos];
+
+        VelocityWrite[pos] = currentVelocity + float4(totalForce, 0, 0);
+    }
+
+    // if (OccupancyWrite[pos] == 1 && PositionWrite[pos].w == 1)
+    // {
+    //     float2 position = float2(pos);
+    //     float2 closestForce = float2(0, 0);
+    //     float closestDistance = 1e10; // A large initial value
+
+    //     for (uint i = 0; i < AttractorsCount; i++)
+    //     {
+    //         AttractorData attractor = Attractors[i];
+    //         float distance = length(position - attractor.position);
+            
+    //         if (distance < closestDistance)
+    //         {
+    //             closestDistance = distance;
+    //             closestForce = CalculateAttractionForce(position, attractor.position, attractor.attractionForce * AttractionMultiplier, AttractionRadius);
+    //         }
+    //     }
+
+    //     float4 currentVelocity = VelocityWrite[pos];
+    //     VelocityWrite[pos] = currentVelocity + float4(closestForce, 0, 0);
+    // }
+}
